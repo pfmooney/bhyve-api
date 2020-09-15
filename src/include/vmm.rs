@@ -3,8 +3,9 @@
 //! These are defined in Rust, but mimic the C constants and structs
 //! defined in `machine/vmm.h`.
 
+use std::os::raw::{c_int, c_uint, c_ulonglong, c_void};
 
-use std::os::raw::{c_int, c_uint, c_ulonglong};
+use num_enum::TryFromPrimitive;
 
 pub const VM_MAXCPU: usize = 32;    // maximum virtual cpus
 
@@ -69,6 +70,7 @@ pub enum vm_reg_name {
         VM_REG_GUEST_DR2,
         VM_REG_GUEST_DR3,
         VM_REG_GUEST_DR6,
+        VM_REG_GUEST_ENTRY_INST_LENGTH,
         VM_REG_LAST
 }
 
@@ -131,54 +133,26 @@ pub enum vm_paging_mode {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct vm_guest_paging {
-    pub cr3: c_ulonglong,
-    pub cpl: c_int,
-    pub cpu_mode: vm_cpu_mode,
-    pub paging_mode: vm_paging_mode,
+    pub gpa: u64,
+    pub fault_type: c_int,
 }
 
-// The data structures 'vie' and 'vie_op' are meant to be opaque to the
-// consumers of instruction decoding. The only reason why their contents
-// need to be exposed is because they are part of the 'vm_exit' structure.
-//
-// These structs are not public, and should never be used. They are
-// defined solely to allow Rust to calculate adequate memory allocation
-// for the 'vm_exit' struct.
 
+// Kernel-internal MMIO decoding and emulation.
+// Userspace should not expect to see this, but rather a
+// VM_EXITCODE_MMIO with the above 'mmio' context.
 #[repr(C)]
-#[derive(Copy, Clone)]
-struct vie_op {
-    op_byte: u8,
-    op_type: u8,
-    op_flags: u16,
+#[allow(unused)]
+struct mmio_emul{
+    gpa: u64,
+    gla: u64,
+    cs_base: u64,
+    cs_d: c_int,
 }
 
-// For now, this is punting on C bitfields by allocating arrays of bytes.
-// If we end up using this code, we will want some more precise way to
-// mimic C bitfields, like David Tolnay's #[bitfield] attribute macro.
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct vie {
-    inst: [u8; 15],
-    num_valid: u8,
-    num_processed: u8,
-    bitfields: [u8; 5], // This is two bits too large
-    disp_bytes: u8,
-    imm_bytes: u8,
-    scale: u8,
-    base_register: i32,
-    index_register: i32,
-    segment_register: i32,
-    displacement: i64,
-    immediate: i64,
-    decoded: u8,
-    op: vie_op,
-}
-
-#[repr(C)]
+#[repr(i32)]
 #[allow(non_camel_case_types, unused)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, TryFromPrimitive)]
 pub enum vm_exitcode {
         VM_EXITCODE_INOUT,
         VM_EXITCODE_VMX,
@@ -191,11 +165,11 @@ pub enum vm_exitcode {
         VM_EXITCODE_PAGING,
         VM_EXITCODE_INST_EMUL,
         VM_EXITCODE_SPINUP_AP,
-        VM_EXITCODE_DEPRECATED1,        // used to be SPINDOWN_CPU
+        VM_EXITCODE_MMIO_EMUL,
         VM_EXITCODE_RUNBLOCK,
         VM_EXITCODE_IOAPIC_EOI,
         VM_EXITCODE_SUSPENDED,
-        VM_EXITCODE_INOUT_STR,
+        VM_EXITCODE_MMIO,
         VM_EXITCODE_TASK_SWITCH,
         VM_EXITCODE_MONITOR,
         VM_EXITCODE_MWAIT,
@@ -203,65 +177,53 @@ pub enum vm_exitcode {
         VM_EXITCODE_REQIDLE,
         VM_EXITCODE_DEBUG,
         VM_EXITCODE_VMINSN,
+        VM_EXITCODE_BPT,
         VM_EXITCODE_HT,
-        VM_EXITCODE_MAX
 }
+
+#[repr(u32)]
+#[allow(non_camel_case_types, unused)]
+#[derive(Copy, Clone)]
+pub enum vm_entry_cmds {
+    VEC_DEFAULT = 0,
+    VEC_DISCARD_INSTR,
+    VEC_COMPLETE_MMIO,
+    VEC_COMPLETE_INOUT,
+}
+
+const INOUT_IN: u8 = 1 << 0;
+#[allow(unused)]
+const INOUT_STR: u8 = 1 << 1;
+#[allow(unused)]
+const INOUT_REP: u8 = 1 << 2;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct vm_inout {
-    bitfields: u16,
-    pub port: u16,
     pub eax: u32,
+    pub port: u16,
+    pub bytes: u8,
+    pub flags: u8,
+
+    /* fields used only by in-kernel emulation */
+    addrsize: u8,
+    segment: u8,
 }
 
 impl vm_inout {
-    pub fn bytes(&self) -> u16 {
-        // We only care about the first three bits of the bitfield
-        let bytes = self.bitfields & 0b0111;
-        return bytes;
-    }
     pub fn is_in(&self) -> bool {
-        // We only care about the fourth bit of the bitfield
-        let mask: u16 = 0b01000;
-        if (self.bitfields & mask) == mask {
-            return true;
-        } else {
-            return false;
-        }
-    }
-    pub fn is_string(&self) -> bool {
-        // We only care about the fifth bit of the bitfield
-        let mask: u16 = 0b010000;
-        if (self.bitfields & mask) == mask {
-            return true;
-        } else {
-            return false;
-        }
-    }
-    pub fn is_repeat(&self) -> bool {
-        // We only care about the sixth bit of the bitfield
-        let mask: u16 = 0b0100000;
-        if (self.bitfields & mask) == mask {
-            return true;
-        } else {
-            return false;
-        }
+        (self.flags & INOUT_IN) != 0
     }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct vm_inout_str {
-    pub inout: vm_inout, // must be the first element
-    pub paging: vm_guest_paging,
-    pub rflags: c_ulonglong,
-    pub cr0: c_ulonglong,
-    pub index: c_ulonglong,
-    pub count: c_ulonglong, // is_repeat=true (%rcx), is_repeat=false (1)
-    pub addrsize: c_int,
-    pub segname: vm_reg_name,
-    pub seg_desc: seg_desc,
+pub struct vm_mmio {
+    pub bytes: u8,
+    pub read: u8,
+    pub _pad: [u16; 3],
+    pub gpa: u64,
+    pub data: u64,
 }
 
 #[repr(C)]
@@ -286,22 +248,29 @@ pub struct vm_task_switch {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub struct vm_exit {
-    pub exitcode: vm_exitcode,
+    pub exitcode: c_int,
     pub inst_length: c_int,    // 0 means unknown
-    pub rip: c_ulonglong,
+    pub rip: u64,
     pub u: vm_exit_payload,
 }
 
-impl Default for vm_exit {
-    fn default() -> vm_exit {
-        let payload = vm_exit_payload { empty: 0 };
-        vm_exit {
-            exitcode: vm_exitcode::VM_EXITCODE_MAX,
-            inst_length: 0,
-            rip: 0,
-            u: payload
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct vm_entry {
+    pub cpuid: c_int,
+    pub cmd: c_uint,
+    pub exit_data: *mut c_void,
+    pub u: vm_entry_payload,
+}
+impl vm_entry {
+    pub fn new(cpuid: i32, cmd: vm_entry_cmds, exitp: *mut vm_exit, payload: vm_entry_payload) -> Self {
+        vm_entry {
+            cpuid,
+            cmd: cmd as u32,
+            exit_data: exitp as *mut c_void,
+            u: payload,
         }
     }
 }
@@ -310,7 +279,7 @@ impl Default for vm_exit {
 #[derive(Copy, Clone)]
 pub union vm_exit_payload {
     pub inout: vm_inout,
-    pub inout_str: vm_inout_str,
+    pub mmio: vm_mmio,
     pub paging: vm_exit_paging,
     pub inst_emul: vm_exit_inst_emul,
     pub vmx: vm_exit_vmx,
@@ -321,9 +290,30 @@ pub union vm_exit_payload {
     pub ioapic_eoi: vm_exit_ioapic_eoi,
     pub suspended: vm_exit_suspended,
     pub task_switch: vm_task_switch,
-    empty: c_int,
+    // sized to zero entire union
+    empty: [u64; 6],
 }
 
+impl Default for vm_exit_payload {
+    fn default() -> vm_exit_payload {
+        vm_exit_payload { empty: [0u64; 6] }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union vm_entry_payload {
+    pub inout: vm_inout,
+    pub mmio: vm_mmio,
+    // sized to zero entire union
+    empty: [u64; 3],
+}
+
+impl Default for vm_entry_payload {
+    fn default() -> vm_entry_payload {
+        vm_entry_payload { empty: [0u64; 3] }
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -335,12 +325,8 @@ pub struct vm_exit_paging {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct vm_exit_inst_emul {
-    pub gpa: c_ulonglong,
-    pub gla: c_ulonglong,
-    pub cs_base: c_ulonglong,
-    pub cs_d: c_int,   // CS.D
-    pub paging: vm_guest_paging,
-    vie: vie,
+    pub inst: [u8; 15],
+    pub num_valid: u8,
 }
 
 // VMX specific payload. Used when there is no "better"

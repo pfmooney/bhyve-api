@@ -5,7 +5,7 @@
 
 use std::os::raw::{c_int, c_uint, c_long, c_longlong, c_ulonglong, c_char};
 use std::mem::size_of;
-use libc::{size_t};
+use libc::{size_t, timeval};
 
 use crate::include::vmm::*;
 
@@ -13,187 +13,93 @@ use crate::include::vmm::*;
 
 const SPECNAMELEN: usize = 255; // max length of devicename
 
-// Define struct from sys/time.h
-
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct timeval {
-    pub tv_sec: c_long,    // seconds
-    pub tv_usec: c_long,   // and microseconds
-}
-
-// Define constants from sys/ioccom.h
-
-// Ioctl's have the command encoded in the lower word, and the size of
-// any in or out parameters in the upper word.  The high 3 bits of the
-// upper word are used to encode the in/out status of the parameter.
-
-const IOCPARM_MASK: c_uint = 0xff;      // parameters must be < 256 bytes
-const IOCPARM_SIZESHIFT: c_uint = 16;
-
-const IOC_VOID: c_uint = 0x20000000;    // no parameters
-const IOC_OUT: c_uint = 0x40000000;     // copy out parameters
-const IOC_IN: c_uint = 0x80000000;      // copy in parameters
-const IOC_INOUT: c_uint = IOC_IN|IOC_OUT;
-
-// Macro for defining all Bhyve ioctl operation constants.
-macro_rules! define_ioctl_op {
-    ($inout:expr, $ioctl_number:expr, $param_size:expr) => {
-        (($inout) | ((($param_size) & IOCPARM_MASK) << IOCPARM_SIZESHIFT) | (VMM_IOC_GROUP) | ($ioctl_number)) as c_int
-    };
-}
-
 // Define constants from machine/vmm_dev.h
 
-// Identifies ioctl ops for Bhyve
-const VMM_IOC_GROUP: c_uint = 118 << 8; // 118 is ASCII for 'v'
+const VMMCTL_IOC_BASE: i32 = ((b'V' as i32) << 16) | ((b'M' as i32)  << 8);
+const VMM_IOC_BASE: i32 = ((b'v' as i32)  << 16) | ((b'm' as i32)  << 8);
+const VMM_LOCK_IOC_BASE: i32 = ((b'v' as i32)  << 16) | ((b'l' as i32)  << 8);
+const VMM_CPU_IOC_BASE: i32 = ((b'v' as i32)  << 16) | ((b'p' as i32)  << 8);
 
-#[repr(C)]
-#[allow(non_camel_case_types, unused)]
-#[derive(Copy, Clone)]
-enum IocNum {
-        // general routines
-        IOCNUM_ABIVERS = 0,
-        IOCNUM_RUN = 1,
-        IOCNUM_SET_CAPABILITY = 2,
-        IOCNUM_GET_CAPABILITY = 3,
-        IOCNUM_SUSPEND = 4,
-        IOCNUM_REINIT = 5,
+/* Operations performed on the vmmctl device */
+pub const VMM_CREATE_VM: i32 = VMMCTL_IOC_BASE | 0x01;
+pub const VMM_DESTROY_VM: i32 = VMMCTL_IOC_BASE | 0x02;
+pub const VMM_VM_SUPPORTED: i32 = VMMCTL_IOC_BASE | 0x03;
 
-        // memory apis
-        IOCNUM_MAP_MEMORY = 10,                 // deprecated
-        IOCNUM_GET_MEMORY_SEG = 11,             // deprecated
-        IOCNUM_GET_GPA_PMAP = 12,
-        IOCNUM_GLA2GPA = 13,
-        IOCNUM_ALLOC_MEMSEG = 14,
-        IOCNUM_GET_MEMSEG = 15,
-        IOCNUM_MMAP_MEMSEG = 16,
-        IOCNUM_MMAP_GETNEXT = 17,
-        IOCNUM_GLA2GPA_NOFAULT = 18,
-        IOCNUM_MUNMAP_MEMSEG = 19,
+/* Operations performed in the context of a given vCPU */
+pub const VM_RUN: i32 = VMM_CPU_IOC_BASE | 0x01;
+pub const VM_SET_REGISTER: i32 = VMM_CPU_IOC_BASE | 0x02;
+pub const VM_GET_REGISTER: i32 = VMM_CPU_IOC_BASE | 0x03;
+pub const VM_SET_SEGMENT_DESCRIPTOR: i32 = VMM_CPU_IOC_BASE | 0x04;
+pub const VM_GET_SEGMENT_DESCRIPTOR: i32 = VMM_CPU_IOC_BASE | 0x05;
+pub const VM_SET_REGISTER_SET: i32 = VMM_CPU_IOC_BASE | 0x06;
+pub const VM_GET_REGISTER_SET: i32 = VMM_CPU_IOC_BASE | 0x07;
+pub const VM_INJECT_EXCEPTION: i32 = VMM_CPU_IOC_BASE | 0x08;
+pub const VM_SET_CAPABILITY: i32 = VMM_CPU_IOC_BASE | 0x09;
+pub const VM_GET_CAPABILITY: i32 = VMM_CPU_IOC_BASE | 0x0a;
+pub const VM_PPTDEV_MSI: i32 = VMM_CPU_IOC_BASE | 0x0b;
+pub const VM_PPTDEV_MSIX: i32 = VMM_CPU_IOC_BASE | 0x0c;
+pub const VM_SET_X2APIC_STATE: i32 = VMM_CPU_IOC_BASE | 0x0d;
+pub const VM_GLA2GPA: i32 = VMM_CPU_IOC_BASE | 0x0e;
+pub const VM_GLA2GPA_NOFAULT: i32 = VMM_CPU_IOC_BASE | 0x0f;
+pub const VM_ACTIVATE_CPU: i32 = VMM_CPU_IOC_BASE | 0x10;
+pub const VM_SET_INTINFO: i32 = VMM_CPU_IOC_BASE | 0x11;
+pub const VM_GET_INTINFO: i32 = VMM_CPU_IOC_BASE | 0x12;
+pub const VM_RESTART_INSTRUCTION: i32 = VMM_CPU_IOC_BASE | 0x13;
+pub const VM_SET_KERNEMU_DEV: i32 = VMM_CPU_IOC_BASE | 0x14;
+pub const VM_GET_KERNEMU_DEV: i32 = VMM_CPU_IOC_BASE | 0x15;
 
-        // register/state accessors
-        IOCNUM_SET_REGISTER = 20,
-        IOCNUM_GET_REGISTER = 21,
-        IOCNUM_SET_SEGMENT_DESCRIPTOR = 22,
-        IOCNUM_GET_SEGMENT_DESCRIPTOR = 23,
-        IOCNUM_SET_REGISTER_SET = 24,
-        IOCNUM_GET_REGISTER_SET = 25,
+/* Operations requiring write-locking the VM */
+pub const VM_REINIT: i32 = VMM_LOCK_IOC_BASE | 0x01;
+pub const VM_BIND_PPTDEV: i32 = VMM_LOCK_IOC_BASE | 0x02;
+pub const VM_UNBIND_PPTDEV: i32 = VMM_LOCK_IOC_BASE | 0x03;
+pub const VM_MAP_PPTDEV_MMIO: i32 = VMM_LOCK_IOC_BASE | 0x04;
+pub const VM_ALLOC_MEMSEG: i32 = VMM_LOCK_IOC_BASE | 0x05;
+pub const VM_MMAP_MEMSEG: i32 = VMM_LOCK_IOC_BASE | 0x06;
 
-        // interrupt injection
-        IOCNUM_GET_INTINFO = 28,
-        IOCNUM_SET_INTINFO = 29,
-        IOCNUM_INJECT_EXCEPTION = 30,
-        IOCNUM_LAPIC_IRQ = 31,
-        IOCNUM_INJECT_NMI = 32,
-        IOCNUM_IOAPIC_ASSERT_IRQ = 33,
-        IOCNUM_IOAPIC_DEASSERT_IRQ = 34,
-        IOCNUM_IOAPIC_PULSE_IRQ = 35,
-        IOCNUM_LAPIC_MSI = 36,
-        IOCNUM_LAPIC_LOCAL_IRQ = 37,
-        IOCNUM_IOAPIC_PINCOUNT = 38,
-        IOCNUM_RESTART_INSTRUCTION = 39,
+pub const VM_WRLOCK_CYCLE: i32 = VMM_LOCK_IOC_BASE | 0xff;
 
-        // PCI pass-thru
-        IOCNUM_BIND_PPTDEV = 40,
-        IOCNUM_UNBIND_PPTDEV = 41,
-        IOCNUM_MAP_PPTDEV_MMIO = 42,
-        IOCNUM_PPTDEV_MSI = 43,
-        IOCNUM_PPTDEV_MSIX = 44,
-        IOCNUM_GET_PPTDEV_LIMITS = 45,
+/* All other ioctls */
+pub const VM_GET_GPA_PMAP: i32 = VMM_IOC_BASE | 0x01;
+pub const VM_GET_MEMSEG: i32 = VMM_IOC_BASE | 0x02;
+pub const VM_MMAP_GETNEXT: i32 = VMM_IOC_BASE | 0x03;
 
-        // statistics
-        IOCNUM_VM_STATS = 50,
-        IOCNUM_VM_STAT_DESC = 51,
+pub const VM_LAPIC_IRQ: i32 = VMM_IOC_BASE | 0x04;
+pub const VM_LAPIC_LOCAL_IRQ: i32 = VMM_IOC_BASE | 0x05;
+pub const VM_LAPIC_MSI: i32 = VMM_IOC_BASE | 0x06;
 
-        // kernel device state
-        IOCNUM_SET_X2APIC_STATE = 60,
-        IOCNUM_GET_X2APIC_STATE = 61,
-        IOCNUM_GET_HPET_CAPABILITIES = 62,
+pub const VM_IOAPIC_ASSERT_IRQ: i32 = VMM_IOC_BASE | 0x07;
+pub const VM_IOAPIC_DEASSERT_IRQ: i32 = VMM_IOC_BASE | 0x08;
+pub const VM_IOAPIC_PULSE_IRQ: i32 = VMM_IOC_BASE | 0x09;
 
-        // CPU Topology
-        IOCNUM_SET_TOPOLOGY = 63,
-        IOCNUM_GET_TOPOLOGY = 64,
+pub const VM_ISA_ASSERT_IRQ: i32 = VMM_IOC_BASE | 0x0a;
+pub const VM_ISA_DEASSERT_IRQ: i32 = VMM_IOC_BASE | 0x0b;
+pub const VM_ISA_PULSE_IRQ: i32 = VMM_IOC_BASE | 0x0c;
+pub const VM_ISA_SET_IRQ_TRIGGER: i32 = VMM_IOC_BASE | 0x0d;
 
-        // legacy interrupt injection
-        IOCNUM_ISA_ASSERT_IRQ = 80,
-        IOCNUM_ISA_DEASSERT_IRQ = 81,
-        IOCNUM_ISA_PULSE_IRQ = 82,
-        IOCNUM_ISA_SET_IRQ_TRIGGER = 83,
+pub const VM_RTC_WRITE: i32 = VMM_IOC_BASE | 0x0e;
+pub const VM_RTC_READ: i32 = VMM_IOC_BASE | 0x0f;
+pub const VM_RTC_SETTIME: i32 = VMM_IOC_BASE | 0x10;
+pub const VM_RTC_GETTIME: i32 = VMM_IOC_BASE | 0x11;
 
-        // vm_cpuset
-        IOCNUM_ACTIVATE_CPU = 90,
-        IOCNUM_GET_CPUSET = 91,
-        IOCNUM_SUSPEND_CPU = 92,
-        IOCNUM_RESUME_CPU = 93,
+pub const VM_SUSPEND: i32 = VMM_IOC_BASE | 0x12;
 
-        // RTC
-        IOCNUM_RTC_READ = 100,
-        IOCNUM_RTC_WRITE = 101,
-        IOCNUM_RTC_SETTIME = 102,
-        IOCNUM_RTC_GETTIME = 103,
+pub const VM_IOAPIC_PINCOUNT: i32 = VMM_IOC_BASE | 0x13;
+pub const VM_GET_PPTDEV_LIMITS: i32 = VMM_IOC_BASE | 0x14;
+pub const VM_GET_HPET_CAPABILITIES: i32 = VMM_IOC_BASE | 0x15;
 
-        // illumos-custom ioctls
-        IOCNUM_DEVMEM_GETOFFSET = 256,
-        IOCNUM_WRLOCK_CYCLE = 257,
-}
+pub const VM_STATS_IOC: i32 = VMM_IOC_BASE | 0x16;
+pub const VM_STAT_DESC: i32 = VMM_IOC_BASE | 0x17;
 
-pub const VM_RUN: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_RUN as c_uint, (size_of::<vm_run>() as c_uint));
-pub const VM_SUSPEND: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SUSPEND as c_uint, (size_of::<vm_suspend>() as c_uint));
-pub const VM_REINIT: c_int = define_ioctl_op!(IOC_VOID, IocNum::IOCNUM_REINIT as c_uint, 0);
-
-pub const VM_ALLOC_MEMSEG: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_ALLOC_MEMSEG as c_uint, (size_of::<vm_memseg>() as c_uint));
-pub const VM_GET_MEMSEG: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_MEMSEG as c_uint, (size_of::<vm_memseg>() as c_uint));
-
-pub const VM_MMAP_MEMSEG: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_MMAP_MEMSEG as c_uint, (size_of::<vm_memmap>() as c_uint));
-pub const VM_MMAP_GETNEXT: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_MMAP_GETNEXT as c_uint, (size_of::<vm_memmap>() as c_uint));
-pub const VM_MUNMAP_MEMSEG: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_MUNMAP_MEMSEG as c_uint, (size_of::<vm_munmap>() as c_uint));
-
-pub const VM_SET_REGISTER: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_REGISTER as c_uint, (size_of::<vm_register>() as c_uint));
-pub const VM_GET_REGISTER: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_REGISTER as c_uint, (size_of::<vm_register>() as c_uint));
-pub const VM_SET_SEGMENT_DESCRIPTOR: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_SEGMENT_DESCRIPTOR as c_uint, (size_of::<vm_seg_desc>() as c_uint));
-pub const VM_GET_SEGMENT_DESCRIPTOR: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_SEGMENT_DESCRIPTOR as c_uint, (size_of::<vm_seg_desc>() as c_uint));
-
-pub const VM_SET_CAPABILITY: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_CAPABILITY as c_uint, (size_of::<vm_capability>() as c_uint));
-pub const VM_GET_CAPABILITY: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_CAPABILITY as c_uint, (size_of::<vm_capability>() as c_uint));
-
-pub const VM_SET_X2APIC_STATE: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_X2APIC_STATE as c_uint, (size_of::<vm_x2apic>() as c_uint));
-pub const VM_GET_X2APIC_STATE: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_X2APIC_STATE as c_uint, (size_of::<vm_x2apic>() as c_uint));
-
-pub const VM_SET_TOPOLOGY: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_TOPOLOGY as c_uint, (size_of::<vm_cpu_topology>() as c_uint));
-pub const VM_GET_TOPOLOGY: c_int = define_ioctl_op!(IOC_OUT, IocNum::IOCNUM_GET_TOPOLOGY as c_uint, (size_of::<vm_cpu_topology>() as c_uint));
-pub const VM_STATS_IOC: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_VM_STATS as c_uint, (size_of::<vm_stats>() as c_uint));
+pub const VM_INJECT_NMI: i32 = VMM_IOC_BASE | 0x18;
+pub const VM_GET_X2APIC_STATE: i32 = VMM_IOC_BASE | 0x19;
+pub const VM_SET_TOPOLOGY: i32 = VMM_IOC_BASE | 0x1a;
+pub const VM_GET_TOPOLOGY: i32 = VMM_IOC_BASE | 0x1b;
+pub const VM_GET_CPUS: i32 = VMM_IOC_BASE | 0x1c;
+pub const VM_SUSPEND_CPU: i32 = VMM_IOC_BASE | 0x1d;
+pub const VM_RESUME_CPU: i32 = VMM_IOC_BASE | 0x1e;
 
 
-pub const VM_ACTIVATE_CPU: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_ACTIVATE_CPU as c_uint, (size_of::<vm_activate_cpu>() as c_uint));
-pub const VM_SUSPEND_CPU: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SUSPEND_CPU as c_uint, (size_of::<vm_activate_cpu>() as c_uint));
-pub const VM_RESUME_CPU: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_RESUME_CPU as c_uint, (size_of::<vm_activate_cpu>() as c_uint));
-
-pub const VM_RTC_WRITE: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_RTC_WRITE as c_uint, (size_of::<vm_rtc_data>() as c_uint));
-pub const VM_RTC_READ: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_RTC_READ as c_uint, (size_of::<vm_rtc_data>() as c_uint));
-pub const VM_RTC_SETTIME: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_RTC_SETTIME as c_uint, (size_of::<vm_rtc_time>() as c_uint));
-pub const VM_RTC_GETTIME: c_int = define_ioctl_op!(IOC_OUT, IocNum::IOCNUM_RTC_GETTIME as c_uint, (size_of::<vm_rtc_time>() as c_uint));
-
-pub const VM_SET_INTINFO: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_SET_INTINFO as c_uint, (size_of::<vm_intinfo>() as c_uint));
-pub const VM_GET_INTINFO: c_int = define_ioctl_op!(IOC_INOUT, IocNum::IOCNUM_GET_INTINFO as c_uint, (size_of::<vm_intinfo>() as c_uint));
-pub const VM_INJECT_EXCEPTION: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_INJECT_EXCEPTION as c_uint, (size_of::<vm_exception>() as c_uint));
-pub const VM_INJECT_NMI: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_INJECT_NMI as c_uint, (size_of::<vm_nmi>() as c_uint));
-pub const VM_LAPIC_IRQ: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_LAPIC_IRQ as c_uint, (size_of::<vm_lapic_irq>() as c_uint));
-pub const VM_LAPIC_LOCAL_IRQ: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_LAPIC_LOCAL_IRQ as c_uint, (size_of::<vm_lapic_irq>() as c_uint));
-pub const VM_LAPIC_MSI: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_LAPIC_MSI as c_uint, (size_of::<vm_lapic_msi>() as c_uint));
-pub const VM_IOAPIC_ASSERT_IRQ: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_IOAPIC_ASSERT_IRQ as c_uint, (size_of::<vm_ioapic_irq>() as c_uint));
-pub const VM_IOAPIC_DEASSERT_IRQ: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_IOAPIC_DEASSERT_IRQ as c_uint, (size_of::<vm_ioapic_irq>() as c_uint));
-pub const VM_IOAPIC_PULSE_IRQ: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_IOAPIC_PULSE_IRQ as c_uint, (size_of::<vm_ioapic_irq>() as c_uint));
-pub const VM_IOAPIC_PINCOUNT: c_int = define_ioctl_op!(IOC_OUT, IocNum::IOCNUM_IOAPIC_PINCOUNT as c_uint, (size_of::<c_int>() as c_uint));
-pub const VM_RESTART_INSTRUCTION: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_RESTART_INSTRUCTION as c_uint, (size_of::<c_int>() as c_uint));
-
-pub const VM_DEVMEM_GETOFFSET: c_int = define_ioctl_op!(IOC_IN, IocNum::IOCNUM_DEVMEM_GETOFFSET as c_uint, (size_of::<vm_devmem_offset>() as c_uint));
-
-
-// ioctls used against ctl device for vm create/destroy
-const VMM_IOC_BASE: c_int = (86 << 16) | (77 << 8); // ASCII for 'V' and 'M'
-pub const VMM_CREATE_VM: c_int = VMM_IOC_BASE | 0x01;
-pub const VMM_DESTROY_VM: c_int = VMM_IOC_BASE | 0x02;
+pub const VM_DEVMEM_GETOFFSET: i32 = VMM_IOC_BASE | 0xff;
 
 
 // Define structs from machine/vmm_dev.h
@@ -370,7 +276,10 @@ impl Default for vm_stats {
         vm_stats {
             cpuid: 0,
             num_entries: 0,
-            tv: timeval::default(),
+            tv: timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
             statbuf: [0; MAX_VM_STATS],
         }
     }

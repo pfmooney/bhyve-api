@@ -1,12 +1,14 @@
 //! Bhyve virtual machine operations.
 
 use libc::{ioctl, open, O_RDWR, c_void, sysconf, _SC_PAGESIZE, EINVAL, EFAULT};
+use std::convert::TryFrom;
 use std::ffi::{CString, CStr};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 pub use crate::include::vmm::{vm_cap_type, vm_reg_name};
 use crate::include::vmm::{vm_suspend_how, vm_exitcode, x2apic_state, seg_desc};
+use crate::include::vmm::{vm_entry, vm_entry_payload, vm_entry_cmds, vm_exit};
 use crate::include::vmm_dev::*;
 use crate::include::specialreg::{CR0_NE};
 use crate::Error;
@@ -124,19 +126,9 @@ impl VirtualMachine {
     }
 
     /// Unmap the memory segment at the guest physical address range [gpa,gpa+len)
-    pub fn munmap_memseg(&self, gpa: u64, len: usize) -> Result<bool, Error> {
-        // Struct is allocated (and owned) by Rust
-        let mem_data = vm_munmap {
-            gpa: gpa,
-            len: len,
-        };
-
-        let result = unsafe { ioctl(self.vm.as_raw_fd(), VM_MUNMAP_MEMSEG, &mem_data) };
-        if result == 0 {
-            return Ok(true);
-        } else {
-            return Err(Error::last());
-        }
+    pub fn munmap_memseg(&self, _gpa: u64, _len: usize) -> Result<bool, Error> {
+        // leave unwired for now
+        panic!("cannot munmap");
     }
 
     pub fn alloc_memseg(&self, segid: i32, len: usize, name: &str) -> Result<bool, Error> {
@@ -631,137 +623,125 @@ impl VirtualMachine {
     /// Runs the VirtualMachine, and returns an exit reason.
     pub fn run(&self, vcpu_id: i32) -> Result<VmExit, Error> {
         // Struct is allocated (and owned) by Rust, but modified by C
-        let mut run_data = vm_run {
-            cpuid: vcpu_id,
-            ..Default::default()
+        let (result, exit_data) = unsafe {
+            let mut vme = vm_exit::default();
+            let entry_payload = vm_entry_payload::default();
+
+            let entry = vm_entry::new(vcpu_id, vm_entry_cmds::VEC_DEFAULT, &mut vme, entry_payload);
+            let res = ioctl(self.vm.as_raw_fd(), VM_RUN, &entry);
+            (res, vme)
         };
-        let result = unsafe { ioctl(self.vm.as_raw_fd(), VM_RUN, &mut run_data) };
-        if result == 0 {
-            let rip = run_data.vm_exit.rip;
-            println!("RIP after run is {}", rip);
-            let cid = run_data.cpuid;
-            println!("VCPU ID is {}", cid);
-            match run_data.vm_exit.exitcode {
-                vm_exitcode::VM_EXITCODE_INOUT => {
-                    // Safe because the exit code told us which union field to use.
-                    let io = unsafe { run_data.vm_exit.u.inout };
-                    let port = io.port;
-                    let value = io.eax;
-                    let bytes = io.bytes();
 
-                    if io.is_in() {
-                        return Ok(VmExit::IoIn(port, bytes));
-                    } else {
-                        return Ok(VmExit::IoOut(port, bytes, value));
-                    }
-                }
-                vm_exitcode::VM_EXITCODE_INOUT_STR => {
-                    // Safe because the exit code told us which union field to use.
-                    let vis = unsafe { run_data.vm_exit.u.inout_str };
-                    let io = vis.inout;
-                    let port = io.port;
+        if result != 0 {
+            return Err(Error::last());
+        }
 
-                    if !io.is_string() {
-                        return Err(Error::new(EINVAL));
-                    }
+        let code = match vm_exitcode::try_from(exit_data.exitcode) {
+            Err(_) => {
+                return Err(Error::new(libc::ERANGE));
+            },
+            Ok(code) => code,
+        };
 
-                    let mask: u64 = match vis.addrsize {
-                        2 => 0xffff,
-                        4 => 0xffffffff,
-                        8 => 0xffffffffffffffff,
-                        _ => return Err(Error::new(EINVAL))
-                    };
+        // let rip = exit_data.vm_exit.rip;
+        // println!("RIP after run is {}", rip);
+        // let cid = exit_data.cpuid;
+        // println!("VCPU ID is {}", cid);
 
-                    let index: u64 = vis.index & mask;
-                    let count: u64 = vis.count & mask;
+        match code {
+            vm_exitcode::VM_EXITCODE_INOUT => {
+                // Safe because the exit code told us which union field to use.
+                let io = unsafe { exit_data.u.inout };
 
-                    let bytes = io.bytes();
-                    let repeat = io.is_repeat();
-                    if io.is_in() {
-                        return Ok(VmExit::IoInStr(port, bytes, index, count, repeat));
-                    } else {
-                        return Ok(VmExit::IoOutStr(port, bytes, index, count, repeat));
-                    }
-                }
-                vm_exitcode::VM_EXITCODE_VMX => {
-                    let status = unsafe { run_data.vm_exit.u.vmx.status };
-                    let reason = unsafe { run_data.vm_exit.u.vmx.exit_reason };
-                    let qual = unsafe { run_data.vm_exit.u.vmx.exit_qualification };
-                    let inst_type = unsafe { run_data.vm_exit.u.vmx.inst_type };
-                    let inst_error = unsafe { run_data.vm_exit.u.vmx.inst_error };
-                    return Ok(VmExit::Vmx(status, reason, qual, inst_type, inst_error));
-                }
-                vm_exitcode::VM_EXITCODE_BOGUS => {
-                    return Ok(VmExit::Bogus);
-                }
-                vm_exitcode::VM_EXITCODE_RDMSR => {
-                    return Ok(VmExit::RdMsr);
-                }
-                vm_exitcode::VM_EXITCODE_WRMSR => {
-                    return Ok(VmExit::WrMsr);
-                }
-                vm_exitcode::VM_EXITCODE_HLT => {
-                    return Ok(VmExit::Halt);
-                }
-                vm_exitcode::VM_EXITCODE_MTRAP => {
-                    return Ok(VmExit::Mtrap);
-                }
-                vm_exitcode::VM_EXITCODE_PAUSE => {
-                    return Ok(VmExit::Pause);
-                }
-                vm_exitcode::VM_EXITCODE_PAGING => {
-                    return Ok(VmExit::Paging);
-                }
-                vm_exitcode::VM_EXITCODE_INST_EMUL => {
-                    return Ok(VmExit::InstEmul);
-                }
-                vm_exitcode::VM_EXITCODE_SPINUP_AP => {
-                    return Ok(VmExit::SpinupAp);
-                }
-                vm_exitcode::VM_EXITCODE_DEPRECATED1 => {
-                    return Ok(VmExit::Deprecated);
-                }
-                vm_exitcode::VM_EXITCODE_RUNBLOCK => {
-                    return Ok(VmExit::RunBlock);
-                }
-                vm_exitcode::VM_EXITCODE_IOAPIC_EOI => {
-                    let ioapic = unsafe { run_data.vm_exit.u.ioapic_eoi };
-                    return Ok(VmExit::IoapicEoi(ioapic.vector));
-                }
-                vm_exitcode::VM_EXITCODE_SUSPENDED => {
-                    return Ok(VmExit::Suspended);
-                }
-                vm_exitcode::VM_EXITCODE_TASK_SWITCH => {
-                    return Ok(VmExit::TaskSwitch);
-                }
-                vm_exitcode::VM_EXITCODE_MONITOR => {
-                    return Ok(VmExit::Monitor);
-                }
-                vm_exitcode::VM_EXITCODE_MWAIT => {
-                    return Ok(VmExit::Mwait);
-                }
-                vm_exitcode::VM_EXITCODE_SVM => {
-                    let svm = unsafe { run_data.vm_exit.u.svm };
-                    return Ok(VmExit::Svm(svm.exitcode, svm.exitinfo1, svm.exitinfo2));
-                }
-                vm_exitcode::VM_EXITCODE_REQIDLE => {
-                    return Ok(VmExit::ReqIdle);
-                }
-                vm_exitcode::VM_EXITCODE_DEBUG => {
-                    return Ok(VmExit::Debug);
-                }
-                vm_exitcode::VM_EXITCODE_VMINSN => {
-                    return Ok(VmExit::VmInsn);
-                }
-                vm_exitcode::VM_EXITCODE_HT => {
-                    return Ok(VmExit::Ht);
-                }
-                vm_exitcode::VM_EXITCODE_MAX => {
-                    return Ok(VmExit::Max);
+                if io.is_in() {
+                    Ok(VmExit::IoIn(io.port, io.bytes))
+                } else {
+                    Ok(VmExit::IoOut(io.port, io.bytes, io.eax))
                 }
             }
-        } else {
-            return Err(Error::last());
+            vm_exitcode::VM_EXITCODE_MMIO => {
+                // Safe because the exit code told us which union field to use.
+                let mmio = unsafe { exit_data.u.mmio };
+
+                if mmio.read == 0 {
+                    Ok(VmExit::MmioRead(mmio.gpa, mmio.bytes))
+                } else {
+                    Ok(VmExit::MmioWrite(mmio.gpa, mmio.bytes, mmio.data))
+                }
+            }
+            vm_exitcode::VM_EXITCODE_VMX => {
+                let status = unsafe { exit_data.u.vmx.status };
+                let reason = unsafe { exit_data.u.vmx.exit_reason };
+                let qual = unsafe { exit_data.u.vmx.exit_qualification };
+                let inst_type = unsafe { exit_data.u.vmx.inst_type };
+                let inst_error = unsafe { exit_data.u.vmx.inst_error };
+                Ok(VmExit::Vmx(status, reason, qual, inst_type, inst_error))
+            }
+            vm_exitcode::VM_EXITCODE_BOGUS => {
+                Ok(VmExit::Bogus)
+            }
+            vm_exitcode::VM_EXITCODE_RDMSR => {
+                Ok(VmExit::RdMsr)
+            }
+            vm_exitcode::VM_EXITCODE_WRMSR => {
+                Ok(VmExit::WrMsr)
+            }
+            vm_exitcode::VM_EXITCODE_HLT => {
+                Ok(VmExit::Halt)
+            }
+            vm_exitcode::VM_EXITCODE_MTRAP => {
+                Ok(VmExit::Mtrap)
+            }
+            vm_exitcode::VM_EXITCODE_PAUSE => {
+                Ok(VmExit::Pause)
+            }
+            vm_exitcode::VM_EXITCODE_PAGING => {
+                Ok(VmExit::Paging)
+            }
+            vm_exitcode::VM_EXITCODE_INST_EMUL => {
+                Ok(VmExit::InstEmul)
+            }
+            vm_exitcode::VM_EXITCODE_SPINUP_AP => {
+                Ok(VmExit::SpinupAp)
+            }
+            vm_exitcode::VM_EXITCODE_RUNBLOCK => {
+                Ok(VmExit::RunBlock)
+            }
+            vm_exitcode::VM_EXITCODE_IOAPIC_EOI => {
+                let ioapic = unsafe { exit_data.u.ioapic_eoi };
+                Ok(VmExit::IoapicEoi(ioapic.vector))
+            }
+            vm_exitcode::VM_EXITCODE_SUSPENDED => {
+                Ok(VmExit::Suspended)
+            }
+            vm_exitcode::VM_EXITCODE_TASK_SWITCH => {
+                Ok(VmExit::TaskSwitch)
+            }
+            vm_exitcode::VM_EXITCODE_MONITOR => {
+                Ok(VmExit::Monitor)
+            }
+            vm_exitcode::VM_EXITCODE_MWAIT => {
+                Ok(VmExit::Mwait)
+            }
+            vm_exitcode::VM_EXITCODE_SVM => {
+                let svm = unsafe { exit_data.u.svm };
+                Ok(VmExit::Svm(svm.exitcode, svm.exitinfo1, svm.exitinfo2))
+            }
+            vm_exitcode::VM_EXITCODE_REQIDLE => {
+                Ok(VmExit::ReqIdle)
+            }
+            vm_exitcode::VM_EXITCODE_DEBUG => {
+                Ok(VmExit::Debug)
+            }
+            vm_exitcode::VM_EXITCODE_VMINSN => {
+                Ok(VmExit::VmInsn)
+            }
+            vm_exitcode::VM_EXITCODE_HT => {
+                Ok(VmExit::Ht)
+            }
+            _ => {
+                panic!("unexpected exit {:?}", code);
+            }
         }
     }
 
@@ -1065,10 +1045,10 @@ pub enum MemSegId{
 ///
 #[derive(Debug)]
 pub enum VmExit {
-    IoIn(u16 /* port */, u16 /* bytes */),
-    IoOut(u16 /* port */, u16 /* bytes */, u32 /* value */),
-    IoInStr(u16 /* port */, u16 /* bytes */, u64 /* index */, u64 /* count */, bool /* repeat */),
-    IoOutStr(u16 /* port */, u16 /* bytes */, u64 /* index */, u64 /* count */, bool /* repeat */),
+    IoIn(u16 /* port */, u8 /* bytes */),
+    IoOut(u16 /* port */, u8 /* bytes */, u32 /* value */),
+    MmioRead(u64 /* gpa */, u8 /* bytes */),
+    MmioWrite(u64 /* gpa */, u8 /* bytes */, u64 /* value */),
     Vmx(i32 /* status */, u32 /* exit reason */, u64 /* exit qualification */, i32 /* instruction type */, i32 /* instruction error */),
     Bogus,
     RdMsr,
@@ -1079,7 +1059,6 @@ pub enum VmExit {
     Paging,
     InstEmul,
     SpinupAp,
-    Deprecated,
     RunBlock,
     IoapicEoi(i32 /* vector */),
     Suspended,
@@ -1091,5 +1070,4 @@ pub enum VmExit {
     Debug,
     VmInsn,
     Ht,
-    Max,
 }
