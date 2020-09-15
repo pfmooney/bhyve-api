@@ -621,13 +621,15 @@ impl VirtualMachine {
     }
 
     /// Runs the VirtualMachine, and returns an exit reason.
-    pub fn run(&self, vcpu_id: i32, entry: VmEntry) -> Result<VmExit, Error> {
+    pub fn run(&self, vcpu_id: i32, vm_entry: VmEntry) -> Result<VmExit, Error> {
         // Struct is allocated (and owned) by Rust, but modified by C
         let (result, exit_data) = unsafe {
             let mut vme = vm_exit::default();
             let entry_payload = vm_entry_payload::default();
 
-            let entry = vm_entry::new(vcpu_id, vm_entry_cmds::VEC_DEFAULT, &mut vme, entry_payload);
+            let mut entry = vm_entry::new(vcpu_id, &mut vme);
+            entry.populate(vm_entry);
+
             let res = ioctl(self.vm.as_raw_fd(), VM_RUN, &entry);
             (res, vme)
         };

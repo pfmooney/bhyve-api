@@ -7,6 +7,8 @@ use std::os::raw::{c_int, c_uint, c_ulonglong, c_void};
 
 use num_enum::TryFromPrimitive;
 
+use crate::vm::VmEntry;
+
 pub const VM_MAXCPU: usize = 32;    // maximum virtual cpus
 
 #[repr(C)]
@@ -265,12 +267,45 @@ pub struct vm_entry {
     pub u: vm_entry_payload,
 }
 impl vm_entry {
-    pub fn new(cpuid: i32, cmd: vm_entry_cmds, exitp: *mut vm_exit, payload: vm_entry_payload) -> Self {
+    pub fn new(cpuid: i32, exitp: *mut vm_exit) -> Self {
         vm_entry {
             cpuid,
-            cmd: cmd as u32,
+            cmd: 0,
             exit_data: exitp as *mut c_void,
-            u: payload,
+            u: vm_entry_payload::default()
+        }
+    }
+    pub fn populate(&mut self, entry: VmEntry) {
+        match entry {
+            VmEntry::Normal => {
+                self.cmd = vm_entry_cmds::VEC_DEFAULT as u32;
+            },
+            VmEntry::CompleteIoIn(port, bytes, eax) => {
+                self.cmd = vm_entry_cmds::VEC_COMPLETE_INOUT as u32;
+                self.u.inout.flags = INOUT_IN;
+                self.u.inout.port = port;
+                self.u.inout.bytes = bytes;
+                self.u.inout.eax = eax;
+            },
+            VmEntry::CompleteIoOut(port, bytes) => {
+                self.cmd = vm_entry_cmds::VEC_COMPLETE_INOUT as u32;
+                self.u.inout.flags = 0;
+                self.u.inout.port = port;
+                self.u.inout.bytes = bytes;
+            },
+            VmEntry::CompleteMmioRead(gpa, bytes, data) => {
+                self.cmd = vm_entry_cmds::VEC_COMPLETE_MMIO as u32;
+                self.u.mmio.read = 1;
+                self.u.mmio.gpa = gpa;
+                self.u.mmio.bytes = bytes;
+                self.u.mmio.data = data;
+            },
+            VmEntry::CompleteMmioWrite(gpa, bytes) => {
+                self.cmd = vm_entry_cmds::VEC_COMPLETE_MMIO as u32;
+                self.u.mmio.read = 0;
+                self.u.mmio.gpa = gpa;
+                self.u.mmio.bytes = bytes;
+            },
         }
     }
 }
