@@ -621,7 +621,7 @@ impl VirtualMachine {
     }
 
     /// Runs the VirtualMachine, and returns an exit reason.
-    pub fn run(&self, vcpu_id: i32) -> Result<VmExit, Error> {
+    pub fn run(&self, vcpu_id: i32, entry: VmEntry) -> Result<VmExit, Error> {
         // Struct is allocated (and owned) by Rust, but modified by C
         let (result, exit_data) = unsafe {
             let mut vme = vm_exit::default();
@@ -1070,4 +1070,13 @@ pub enum VmExit {
     Debug,
     VmInsn,
     Ht,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum VmEntry {
+    Normal,
+    CompleteIoIn(u16 /* port */, u8 /* bytes */, u32 /* eax */),
+    CompleteIoOut(u16 /* port */, u8 /* bytes */),
+    CompleteMmioRead(u64 /* gpa */, u8 /* bytes */, u64 /* data */),
+    CompleteMmioWrite(u64 /* gpa */, u8 /* bytes */),
 }
